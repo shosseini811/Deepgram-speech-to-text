@@ -19,65 +19,99 @@ from deepgram import (
 
 load_dotenv()
 
-# We will collect the is_final=true messages here so we can use them when the person finishes speaking
-is_finals = []
-
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 async def main():
     try:
+        print("\nInitializing Deepgram transcription...\n")
+        
         loop = asyncio.get_event_loop()
-
-        for signal in (SIGTERM, SIGINT):
-            loop.add_signal_handler(
-                signal,
-                lambda: asyncio.create_task(
-                    shutdown(signal, loop, dg_connection, microphone)
-                ),
-            )
-
-        # example of setting up a client config. logging values: WARNING, VERBOSE, DEBUG, SPAM
-        config: DeepgramClientOptions = DeepgramClientOptions(
-            options={"keepalive": "true"}
-        )
-        deepgram: DeepgramClient = DeepgramClient("", config)
-        # otherwise, use default config
-        # deepgram: DeepgramClient = DeepgramClient()
-
+        
+        # Configure Deepgram client
+        config = DeepgramClientOptions(options={"keepalive": "true"})
+        
+        # Make sure you have your API key in .env file
+        deepgram = DeepgramClient()  # It will automatically read from DEEPGRAM_API_KEY env variable
+        
+        print("Connecting to Deepgram...")
         dg_connection = deepgram.listen.asyncwebsocket.v("1")
-
-        # Add a variable to store the full transcript
-        full_transcript = []
+        
+        # Dictionary to store transcripts
+        transcripts_by_speaker = {}
 
         async def on_message(self, result, **kwargs):
-            sentence = result.channel.alternatives[0].transcript
-            if len(sentence) > 0 and result.is_final:
-                # Add the sentence to our transcript collection
-                full_transcript.append(sentence)
-                # Clear the screen (optional)
-                print("\033[H\033[J", end="")
-                # Print the full transcript as one paragraph
-                print(" ".join(full_transcript))
+            try:
+                if len(result.channel.alternatives) > 0:
+                    alternative = result.channel.alternatives[0]
+                    sentence = alternative.transcript
+                    
+                    if len(sentence) > 0 and result.is_final:
+                        words = alternative.words
+                        if not words:
+                            return
+                        
+                        current_speaker = words[0].speaker
+                        current_segment = []
+                        
+                        for word in words:
+                            if word.speaker == current_speaker:
+                                current_segment.append(word.word)
+                            else:
+                                if current_speaker not in transcripts_by_speaker:
+                                    transcripts_by_speaker[current_speaker] = []
+                                transcripts_by_speaker[current_speaker].append(" ".join(current_segment))
+                                
+                                current_speaker = word.speaker
+                                current_segment = [word.word]
+                        
+                        if current_segment:
+                            if current_speaker not in transcripts_by_speaker:
+                                transcripts_by_speaker[current_speaker] = []
+                            transcripts_by_speaker[current_speaker].append(" ".join(current_segment))
+                        
+                        print("\033[H\033[J", end="")  # Clear screen
+                        for spk, texts in transcripts_by_speaker.items():
+                            print(f"Speaker {spk + 1}: {' '.join(texts)}")
+                            print()  # Add blank line between speakers
+            except Exception as e:
+                logger.error(f"Error in message handler: {e}")
 
-        # Register only the transcript event
+        # Register event handlers
+        print("Setting up event handlers...")
         dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
 
-        options: LiveOptions = LiveOptions(
+        options = LiveOptions(
             model="nova-2",
             language="en-US",
             smart_format=True,
             encoding="linear16",
             channels=1,
-            sample_rate=24000,
-            interim_results=False,
-            endpointing=1000,
+            sample_rate=16000,
+            endpointing=500,
+            interim_results=True,
             vad_events=True,
+            diarize=True,
+            punctuate=True,
         )
 
-        # Start without printing any messages
-        if await dg_connection.start(options) is False:
+        addons = {
+            "no_delay": "true",
+            "low_latency": "true",
+            "min_speakers": 2,
+            "max_speakers": 6
+        }
+
+        print("\nStarting connection...")
+        if await dg_connection.start(options, addons=addons) is False:
+            print("Failed to connect to Deepgram")
             return
 
+        print("\nInitializing microphone...")
         microphone = Microphone(dg_connection.send)
+
+        print("\n\nReady! Start speaking (Press Ctrl+C to stop)...\n")
         microphone.start()
 
         try:
@@ -86,15 +120,17 @@ async def main():
         except asyncio.CancelledError:
             pass
         finally:
+            print("\nStopping microphone...")
             microphone.finish()
+            print("Closing connection...")
             await dg_connection.finish()
 
     except Exception as e:
+        logger.error(f"Main error: {e}")
         return
 
-
 async def shutdown(signal, loop, dg_connection, microphone):
-    print(f"Received exit signal {signal.name}...")
+    print(f"\nReceived exit signal {signal.name}...")
     microphone.finish()
     await dg_connection.finish()
     tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
@@ -104,5 +140,10 @@ async def shutdown(signal, loop, dg_connection, microphone):
     loop.stop()
     print("Shutdown complete.")
 
-
-asyncio.run(main())
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nProgram terminated by user")
+    except Exception as e:
+        logger.error(f"Program error: {e}")
